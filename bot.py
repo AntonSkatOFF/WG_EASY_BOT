@@ -26,11 +26,19 @@ SELECTING_ACTION, CREATING_CLIENT, SETTING_TRAFFIC, SETTING_EXPIRY, \
 
 # Конфигурация
 WG_EASY_URL = os.getenv('WG_EASY_URL', 'http://localhost:51821')
+WG_EASY_USERNAME = os.getenv('WG_EASY_USERNAME', '')
 WG_EASY_PASSWORD = os.getenv('WG_EASY_PASSWORD', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
-SALE_ENABLED = os.getenv('SALE_ENABLED', 'false').lower() == 'true'
-PAYMENT_METHODS = os.getenv('PAYMENT_METHODS', 'Карта: 1234 5678 9012 3456\nСБП: +7 999 123 45 67')
+SALE_ENABLED = os.getenv('SALE_ENABLED', 'true').lower() == 'true'  # Продажа включена по умолчанию
+
+# Тарифы для продажи (трафик ГБ, срок дней, цена в звёздах)
+TARIFFS = {
+    '1gb_7days': {'traffic': 1, 'days': 7, 'stars': 50, 'name': '1 ГБ / 7 дней'},
+    '5gb_30days': {'traffic': 5, 'days': 30, 'stars': 200, 'name': '5 ГБ / 30 дней'},
+    '10gb_30days': {'traffic': 10, 'days': 30, 'stars': 350, 'name': '10 ГБ / 30 дней'},
+    'unlimited': {'traffic': 0, 'days': 0, 'stars': 1000, 'name': 'Безлимит'}
+}
 
 # Глобальное хранилище сессий
 user_sessions: Dict[int, Dict[str, Any]] = {}
@@ -39,8 +47,9 @@ user_sessions: Dict[int, Dict[str, Any]] = {}
 class WGEasyAPI:
     """Класс для работы с WG Easy API"""
     
-    def __init__(self, base_url: str, password: str):
+    def __init__(self, base_url: str, username: str, password: str):
         self.base_url = base_url.rstrip('/')
+        self.username = username
         self.password = password
         self.session: Optional[aiohttp.ClientSession] = None
         self.cookie: Optional[str] = None
@@ -51,22 +60,36 @@ class WGEasyAPI:
         return self.session
     
     async def authenticate(self) -> bool:
-        """Аутентификация в WG Easy"""
+        """Аутентификация в WG Easy v15.3.0 с логином и паролем"""
         try:
             session = await self._get_session()
-            # WG Easy v15+ использует cookie-based auth
+            # WG Easy v15.3.0 использует username + password
+            payload = {
+                'username': self.username,
+                'password': self.password,
+                'remember': True
+            }
             async with session.post(
                 f"{self.base_url}/api/session",
-                json={'password': self.password},
+                json=payload,
                 headers={'Content-Type': 'application/json'}
             ) as resp:
                 if resp.status == 200:
-                    # Сохраняем cookie из ответа
-                    self.cookie = resp.cookies.get('token', {}).value if resp.cookies.get('token') else None
-                    if not self.cookie:
-                        # Пробуем получить из заголовков
-                        self.cookie = resp.headers.get('Set-Cookie', '').split(';')[0].split('=')[1] if 'Set-Cookie' in resp.headers else None
-                    return True
+                    data = await resp.json()
+                    if data.get('status') == 'success':
+                        # Сохраняем cookie из ответа
+                        for cookie_name, cookie in resp.cookies.items():
+                            if cookie_name in ['token', 'session', 'auth']:
+                                self.cookie = cookie.value
+                                break
+                        if not self.cookie and 'Set-Cookie' in resp.headers:
+                            # Пробуем получить из заголовков
+                            cookie_header = resp.headers.get('Set-Cookie', '')
+                            for part in cookie_header.split(','):
+                                if '=' in part:
+                                    self.cookie = part.split('=')[1].split(';')[0]
+                                    break
+                        return True
                 return False
         except Exception as e:
             print(f"Auth error: {e}")
@@ -214,19 +237,28 @@ class WGEasyAPI:
 
 
 # Глобальный экземпляр API
-wg_api = WGEasyAPI(WG_EASY_URL, WG_EASY_PASSWORD)
+wg_api = WGEasyAPI(WG_EASY_URL, WG_EASY_USERNAME, WG_EASY_PASSWORD)
 
 
-def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Основное меню с кнопками"""
-    keyboard = [
-        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton("👥 Клиенты", callback_data="clients_list")],
-        [InlineKeyboardButton("➕ Создать ключ", callback_data="create_key")],
-        [InlineKeyboardButton("💰 Продажа", callback_data="sale_menu")] if SALE_ENABLED else [],
-        [InlineKeyboardButton("🔄 Синхронизация", callback_data="sync")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
-    ]
+def get_main_menu_keyboard(is_admin: bool = True) -> InlineKeyboardMarkup:
+    """Основное меню с кнопками - разделение для админов и пользователей"""
+    if is_admin:
+        # Меню администратора - полный доступ
+        keyboard = [
+            [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+            [InlineKeyboardButton("👥 Клиенты", callback_data="clients_list")],
+            [InlineKeyboardButton("➕ Создать ключ", callback_data="create_key")],
+            [InlineKeyboardButton("💰 Продажа", callback_data="sale_menu")] if SALE_ENABLED else [],
+            [InlineKeyboardButton("🔄 Синхронизация", callback_data="sync")],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
+        ]
+    else:
+        # Меню пользователя - только покупка и свои ключи
+        keyboard = [
+            [InlineKeyboardButton("💰 Купить VPN", callback_data="buy_vpn")],
+            [InlineKeyboardButton("🔑 Мои ключи", callback_data="my_keys")],
+            [InlineKeyboardButton("📊 Статус", callback_data="user_stats")]
+        ]
     return InlineKeyboardMarkup(keyboard)
 
 
